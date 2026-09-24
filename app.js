@@ -1,7 +1,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
+import fetch, { File, FormData } from "node-fetch";
 dotenv.config();
 
 
@@ -17,10 +17,84 @@ function generateId() {
   return result;
 }
 const app = express();
-app.use(bodyParser.json());
+// Base64 images exceed body-parser's default 100 KB limit.
+app.use(bodyParser.json({ limit: process.env.MAX_REQUEST_SIZE || '50mb' }));
 const botType = process.env.BOT_TYPE || 'Chat';
 const inputVariable = process.env.INPUT_VARIABLE || '';
 const outputVariable = process.env.OUTPUT_VARIABLE || '';
+const difyApiUrl = process.env.DIFY_API_URL.replace(/\/+$/, '');
+
+function invalidRequest(message) {
+  return Object.assign(new Error(message), { status: 400 });
+}
+
+function parseMessage(message) {
+  if (!message || typeof message.role !== 'string') {
+    throw invalidRequest('Each message must have a role.');
+  }
+  if (typeof message.content === 'string') {
+    return { role: message.role, text: message.content, images: [] };
+  }
+  if (message.content == null) {
+    return { role: message.role, text: '', images: [] };
+  }
+  if (!Array.isArray(message.content)) {
+    throw invalidRequest('Message content must be a string or an array of content parts.');
+  }
+  const text = [];
+  const images = [];
+  for (const part of message.content) {
+    if (part?.type === 'text' && typeof part.text === 'string') {
+      text.push(part.text);
+    } else if (part?.type === 'image_url' && typeof part.image_url?.url === 'string') {
+      const url = part.image_url.url;
+      if (url.startsWith('data:')) {
+        const match = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(url);
+        if (!match || match[2].length % 4 === 1) {
+          throw invalidRequest('Invalid Base64 image data URL.');
+        }
+        const bytes = Buffer.from(match[2], 'base64');
+        if (!bytes.length || bytes.toString('base64').replace(/=+$/, '') !== match[2].replace(/=+$/, '')) {
+          throw invalidRequest('Invalid Base64 image data URL.');
+        }
+        images.push({ bytes, mime: match[1].toLowerCase() });
+      } else {
+        let parsed;
+        try { parsed = new URL(url); } catch { throw invalidRequest('Invalid image URL.'); }
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          throw invalidRequest('Image URLs must use HTTP, HTTPS, or a Base64 image data URL.');
+        }
+        images.push({ url });
+      }
+    } else {
+      throw invalidRequest('Unsupported or malformed message content part.');
+    }
+  }
+  return { role: message.role, text: text.join('\n'), images };
+}
+
+async function toDifyFile(image, authorization, user) {
+  if (image.url) {
+    return { type: 'image', transfer_method: 'remote_url', url: image.url };
+  }
+  const extension = image.mime === 'image/jpeg' ? 'jpg' : image.mime.split('/')[1].replace('+xml', '');
+  const form = new FormData();
+  form.set('user', user);
+  form.set('file', new File([image.bytes], `image.${extension}`, { type: image.mime }));
+  const response = await fetch(`${difyApiUrl}/files/upload`, {
+    method: 'POST',
+    headers: { Authorization: authorization },
+    body: form,
+  });
+  if (!response.ok) {
+    throw Object.assign(new Error(`Dify image upload failed (HTTP ${response.status}).`), { status: response.status });
+  }
+  const uploaded = await response.json();
+  if (typeof uploaded.id !== 'string' || !uploaded.id) {
+    throw Object.assign(new Error('Dify image upload returned no file ID.'), { status: 502 });
+  }
+  return { type: 'image', transfer_method: 'local_file', upload_file_id: uploaded.id };
+}
 
 let apiPath;
 switch (botType) {
@@ -102,16 +176,23 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
   try {
     const data = req.body;
-    const messages = data.messages;
+    if (!Array.isArray(data.messages) || data.messages.length === 0) {
+      throw invalidRequest('messages must be a non-empty array.');
+    }
+    const messages = data.messages.map(parseMessage);
+    const user = data.user ?? 'apiuser';
+    if (typeof user !== 'string' || !user.trim()) {
+      throw invalidRequest('user must be a non-empty string.');
+    }
     let queryString;
     if (botType === 'Chat') {
       const lastMessage = messages[messages.length - 1];
       queryString = `here is our talk history:\n'''\n${messages
         .slice(0, -1) 
-        .map((message) => `${message.role}: ${message.content}`)
-        .join('\n')}\n'''\n\nhere is my question:\n${lastMessage.content}`;
+        .map((message) => `${message.role}: ${message.text}`)
+        .join('\n')}\n'''\n\nhere is my question:\n${lastMessage.text}`;
     } else if (botType === 'Completion' || botType === 'Workflow') {
-      queryString = messages[messages.length - 1].content;
+      queryString = messages[messages.length - 1].text;
     }
     const stream = data.stream !== undefined ? data.stream : false;
     let requestBody;
@@ -120,7 +201,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         inputs: { [inputVariable]: queryString },
         response_mode: "streaming",
         conversation_id: "",
-        user: "apiuser",
+        user,
         auto_generate_name: false
       };
     } else {
@@ -129,11 +210,22 @@ app.post("/v1/chat/completions", async (req, res) => {
         query: queryString,
         response_mode: "streaming",
         conversation_id: "",
-        user: "apiuser",
+        user,
         auto_generate_name: false
       };
     }
-    const resp = await fetch(process.env.DIFY_API_URL + apiPath, {
+    // Chat history is replayed on every request, so include its images too.
+    const selectedMessages = botType === 'Chat' ? messages : messages.slice(-1);
+    const files = [];
+    for (const message of selectedMessages) {
+      for (const image of message.images) {
+        files.push(await toDifyFile(image, authHeader, user));
+      }
+    }
+    if (files.length) requestBody.files = files;
+    // Dify Chat requires query even when custom input variables are configured.
+    if (botType === 'Chat') requestBody.query = queryString;
+    const resp = await fetch(difyApiUrl + apiPath, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -141,6 +233,9 @@ app.post("/v1/chat/completions", async (req, res) => {
       },
       body: JSON.stringify(requestBody),
     });
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: { message: `Dify request failed (HTTP ${resp.status}).` } });
+    }
 
     let isResponseEnded = false;
 
@@ -362,7 +457,12 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
   } catch (error) {
-    console.error("Error:", error);
+    console.error("Error:", error.message);
+    if (!res.headersSent) {
+      res.status(error.status || 500).json({ error: { message: error.message } });
+    } else {
+      res.end();
+    }
   }
 });
 

@@ -3,11 +3,19 @@
 
 This project converts the Dify API to the OpenAI API format, giving you access to Dify's LLMs, knowledge base, tools, and workflows within your preferred OpenAI clients.
 
+## 原项目 / Upstream
+
+本仓库基于 [fatwang2/dify2openai](https://github.com/fatwang2/dify2openai) 开发，原作者为 [fatwang2](https://github.com/fatwang2)。感谢原作者的开源贡献。
+
+This fork is based on [fatwang2/dify2openai](https://github.com/fatwang2/dify2openai), created by [fatwang2](https://github.com/fatwang2), and retains the original [MIT License](LICENSE) and copyright notice.
+
+本 Fork 增加了 OpenAI 图片消息到 Dify 的规范转换，支持图片 URL、Base64 上传、多图及相关回归测试。
 
 ## Features
 - Convert Dify API into an OpenAI API
 - Support streaming and blocking
 - Support Chat, Completion, Agent and Workflow bots API on dify
+- Support OpenAI image content parts (HTTP/HTTPS URLs and Base64 data URLs)
 
 ## Deployment
 ### Zeabur
@@ -61,6 +69,46 @@ const response = await fetch('http://localhost:3000/v1/chat/completions', {
 const data = await response.json();
 console.log(data);
 ```
+
+### Images
+
+Send images using OpenAI's `image_url` content parts:
+
+```json
+{
+  "model": "dify",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Describe this image." },
+        {
+          "type": "image_url",
+          "image_url": { "url": "https://example.com/image.png" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The URL can also be a `data:image/png;base64,...` data URL. Text parts are
+combined into the Dify query; images are sent separately in `files`:
+
+- HTTP/HTTPS images use `type: image`, `transfer_method: remote_url`, and `url`.
+- Base64 images are decoded and uploaded to Dify's `/files/upload` as multipart
+  `file` and `user` fields, then referenced with `transfer_method: local_file`
+  and the returned `upload_file_id`.
+
+Uploads and generation use the same API key and `user` (defaults to `apiuser`).
+Multiple images and both streaming and non-streaming OpenAI responses are supported.
+Chat requests replay images from the supplied history; Completion and Workflow
+requests use only the final message. Enable image/file inputs in the Dify app and
+use a model that supports vision. Remote URLs must be accessible from Dify.
+Workflow-specific named file variables are not automatically mapped into `inputs`.
+
+The default JSON request limit is 50 MB, configurable with `MAX_REQUEST_SIZE`.
+Dify's own upload size and file-type limits still apply.
 
 ### Docker Deployment
 
@@ -127,14 +175,15 @@ This project provides some additional configuration items set with environment v
 | `INPUT_VARIABLE`     | No      | The name of input variable in your own dify workflow bot                                                                                                                  | `query,text`                                                                                                 |
 | `OUTPUT_VARIABLE`     | No      | The name of output variable in your own dify workflow bot                                                                                                                  | `text`                                                                                                 |
 | `MODELS_NAME`     | No      | The value is the model name output by the /v1/models endpoint. The default value is `dify`.                                                                                                                 | `dify`                                                                                                 |
+| `MAX_REQUEST_SIZE` | No | Maximum JSON request size, including Base64 images. Defaults to `50mb`. | `50mb` |
 ## Roadmap
 **Coming Soon**
-*   Image support
 *   Audio-to-text
 *   Text-to-audio
 *   Docker support
 
 **Available Now**
+*   Image support (remote URLs and Base64 uploads)
 *   Workflow Bot
 *   Variables support
 *   Continuous dialogue
